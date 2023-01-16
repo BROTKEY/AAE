@@ -15,8 +15,9 @@ if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
 else:
     DEVICE = torch.device("cpu")
+DEVICE = torch.device("cpu")
 
-BATCH = 8
+BATCH = 64
 
 IMAGESIZE = 28
 
@@ -25,58 +26,87 @@ DATA = torchvision.datasets.MNIST(
     download=False, root="./data", train=True, transform=transforms.Compose([transforms.ToTensor()]))
 
 Dataloader = data.DataLoader(dataset=DATA, batch_size=BATCH,
-                             shuffle=True, pin_memory=True, num_workers=0, drop_last=True)
+                             shuffle=True, pin_memory=True, num_workers=6, drop_last=True)
 
 
-class Encoder(nn.Module):
+class AAE(nn.Module):
     def __init__(self):
-        super(Encoder, self).__init__()
-        self.layers = nn.ModuleList()
+        super(AAE, self).__init__()
+        self.encoder = nn.ModuleList()
+        self.decoder = nn.ModuleList()
+
         for i in [1, 2]:
-            self.layers.append(nn.Sequential(
+            self.encoder.append(nn.Sequential(
                 nn.Conv2d(2**(i-1), 2**(i), 4, 2, 1, bias=False),
                 nn.BatchNorm2d(2**i),
                 nn.LeakyReLU()
             ))
-        self.layers.append(nn.Sequential(
+        self.encoder.append(nn.Sequential(
             nn.Conv2d(4, 8, 7, 1, 0, bias=False),
             nn.BatchNorm2d(8),
             nn.Sigmoid()
         ))
 
-    def forward(self, value):
-        output = value
-        for i, layer in enumerate(self.layers):
-            output = layer(output)
-        return output
-
-
-class Decoder(nn.Module):
-    def __init__(self):
-        super(Decoder, self).__init__()
-        self.layers = nn.ModuleList()
-        self.layers.append(nn.Sequential(
-            nn.ConvTranspose2d(9, 4, 7, 1, 0, bias=False),
+        self.decoder.append(nn.Sequential(
+            nn.ConvTranspose2d(8, 4, 7, 1, 0, bias=False),
             nn.BatchNorm2d(4),
             nn.LeakyReLU()
         ))
         for i in [2, 1]:
-            self.layers.append(nn.Sequential(
+            self.decoder.append(nn.Sequential(
                 nn.ConvTranspose2d(2**(i), 2**(i-1), 4, 2, 1, bias=False),
                 nn.BatchNorm2d(2**(i-1)),
-                nn.LeakyReLU()
+                nn.Sigmoid()
             ))
 
-    def forward(self, value):
+    def decode(self, value):
         output = value
-        for i, layer in enumerate(self.layers):
-            output = layer(output)
+
+        for decoder_layer in self.decoder:
+            output = decoder_layer(output)
+        return output
+
+    def encode(self, value):
+        output = value
+        for encoder_layer in self.encoder:
+            output = encoder_layer(output)
+        return output
+
+    def forward(self, value):
+        z = self.encode(value)
+        output = self.decode(z)
         return output
 
 
-class Critic(nn.Module):
+class CriticDecoder(nn.Module):
     def __init__(self):
-        super(Critic, self).__init__()
+        super(CriticEncoder, self).__init__()
+        self.layers = nn.ModuleList()
+        self.layers.append(nn.Sequential(
+            nn.Conv2d(1, 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(2),
+            nn.LeakyReLU(),
+            nn.Conv2d(2, 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(4),
+            nn.LeakyReLU(),
+            nn.Conv2d(4, 8, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(8),
+            nn.LeakyReLU(),
+        ))
+        self.layers.append(nn.Sequential(
+            nn.Linear(8, 8),
+            nn.LeakyReLU(),
+            nn.Linear(8, 1)
+        ))
+
+    def forward(self, value, batch):
+        output = self.layers[0](value).reshape(batch, -1)
+        return self.layers[1](output)
+
+
+class CriticEncoder(nn.Module):
+    def __init__(self):
+        super(CriticEncoder, self).__init__()
         self.layers = nn.ModuleList()
         self.layers.append(nn.Sequential(
             nn.Linear(9, 9),
@@ -86,9 +116,13 @@ class Critic(nn.Module):
             nn.Linear(9, 1)
         ))
 
-    def forward(self, value):
+    def forward(self, value, label, batch):
         output = value
-        for i, layer in enumerate(self.layers):
+
+        output = torch.cat(
+            (output.reshape(batch, -1), label.reshape(batch, 1)), 1)
+
+        for layer in self.layers:
             output = layer(output)
         return output
 
@@ -103,27 +137,20 @@ def initialize_weights(model):
 
 
 def train(epoch):
-    encoder = Encoder()
-    encoder.train()
-    encoder.apply(initialize_weights)
-    encoder.to(device=DEVICE)
-    print(encoder)
+    aae = AAE()
+    aae.train()
+    aae.apply(initialize_weights)
+    aae.to(device=DEVICE)
+    print(aae)
 
-    decoder = Decoder()
-    decoder.train()
-    decoder.apply(initialize_weights)
-    decoder.to(device=DEVICE)
-    print(decoder)
-
-    critic = Critic()
+    critic = CriticEncoder()
     critic.train()
     critic.apply(initialize_weights)
     critic.to(device=DEVICE)
 
     optim_critic = optim.RMSprop(critic.parameters(), lr=0.00005)
-    optim_encoder = optim.RMSprop(encoder.parameters(), lr=0.00005)
-    optim_decoder = optim.AdamW(decoder.parameters(), lr=0.005)
-    loss_function = nn.MSELoss(reduction="sum")
+    optim_aae = optim.AdamW(aae.parameters(), lr=0.00005)
+    loss_function = nn.BCELoss()
     writer = SummaryWriter("runs/GAN/test")
 
     loss_encoder_arr = []
@@ -134,23 +161,22 @@ def train(epoch):
         for iter, (target, label) in enumerate(tqdm(Dataloader)):
             target = target.to(device=DEVICE)
             label = label.to(device=DEVICE)
-            torch.div(label, 10)
 
             # train critic
-            for _ in range(7):
-                random = torch.rand((BATCH, 9), device=DEVICE)
-                critic_rand = critic(random)
+            for _ in range(6):
+                random = torch.rand((BATCH, 8), device=DEVICE)
 
-                hidden_critic = encoder(target).reshape(BATCH, -1)
-                hidden_critic = torch.cat(
-                    (hidden_critic, label.reshape(BATCH, 1)), 1)
-                critic_hidden = critic(hidden_critic).reshape(-1)
+                critic_rand = critic(random, label, BATCH)
+
+                hidden_critic = aae.encode(target).reshape(BATCH, -1)
+
+                critic_hidden = critic(hidden_critic, label, BATCH).reshape(-1)
 
                 # wasserstein loss
                 loss_critic = -(torch.mean(critic_rand) -
                                 torch.mean(critic_hidden))
 
-                loss_encoder_arr.append(loss_critic.item())
+                loss_critic_arr.append(loss_critic.item())
                 for param in critic.parameters():
                     param.grad = None
                 loss_critic.backward(retain_graph=True)
@@ -161,45 +187,40 @@ def train(epoch):
                     p.data.clamp_(-0.01, 0.01)
 
             # train encoder
-            encoded = encoder(target).reshape(BATCH, -1)
-            critic_output = critic(torch.cat(
-                (encoded, label.reshape(BATCH, 1)), 1))
+            encoded = aae.encode(target).reshape(BATCH, -1)
+            critic_output = critic(encoded, label, BATCH)
 
             loss_encoder = -torch.mean(critic_output)
-            loss_decoder_arr.append(loss_encoder.item())
+            loss_encoder_arr.append(loss_encoder.item())
 
-            for param in encoder.parameters():
+            for param in aae.parameters():
                 param.grad = None
             loss_encoder.backward()
-            optim_encoder.step()
+            optim_aae.step()
 
-            # train decoder
-            hidden_decoder = encoder(target).reshape(BATCH, -1)
-            hidden_decoder = torch.cat(
-                (hidden_decoder, label.reshape(BATCH, 1)), 1).reshape(BATCH, 9, 1, 1)
-            decoded = decoder(hidden_decoder)
+            # train AAE
+            decoded = aae(target)
             loss_decoder = loss_function(decoded, target)
-            loss_critic_arr.append(loss_decoder.item())
+            loss_decoder_arr.append(loss_decoder.item())
 
-            for param in decoder.parameters():
+            for param in aae.parameters():
                 param.grad = None
             loss_decoder.backward()
-            optim_decoder.step()
+            optim_aae.step()
 
             global_step = e*len(Dataloader)+iter
             logScalarToTensorboard(
                 lc=loss_critic_arr, ld=loss_decoder_arr, le=loss_encoder_arr, step=global_step, writer=writer)
 
-            if global_step % 1000 == 0 or global_step == 1:
-                logImageToTensorboard(decoder=decoder, encoder=encoder, label=label,
+            if global_step % 250 == 0 or global_step == 1:
+                logImageToTensorboard(aae=aae,
                                       step=global_step, target=target, writer=writer)
                 loss_encoder_arr = []
                 loss_decoder_arr = []
                 loss_critic_arr = []
 
         print("----------------\n\rsaving...")
-        torch.save(encoder, PATH + "Enet.pth")
-        torch.save(decoder, PATH + "Dnet.pth")
+        torch.save(aae, PATH + "net.pth")
         torch.save(critic, PATH + "Cnet.pth")
         writer.flush()
         print("saved\n\r----------------")
@@ -216,10 +237,17 @@ def logScalarToTensorboard(lc, ld, le, writer, step):
         }, global_step=step)
 
 
-def logImageToTensorboard(writer, step, encoder, decoder, target, label):
+def logImageToTensorboard(writer, step, aae, target):
     with torch.no_grad():
-        test = decoder(torch.cat(
-            (encoder(target).reshape(BATCH, -1), label.reshape(BATCH, 1)), 1).reshape(BATCH, 9, 1, 1))
+        noise = aae.decode(torch.rand((BATCH, 8, 1, 1), device=DEVICE))
+
+        noise_grid = torchvision.utils.make_grid(
+            noise[:BATCH], normalize=True
+        )
+
+        writer.add_image("NoiseImage", noise_grid, global_step=step)
+
+        test = aae(target)
 
         test_grid = torchvision.utils.make_grid(
             test[:BATCH], normalize=True
@@ -235,7 +263,7 @@ def logImageToTensorboard(writer, step, encoder, decoder, target, label):
 
 
 def start():
-    train(50)
+    train(200)
 
 
 if __name__ == "__main__":
